@@ -2,13 +2,15 @@ import 'dotenv/config';
 import cors from 'cors';
 import express from 'express';
 import { proposalLatexToPdf } from './pdfExport.js';
-import { answerAgentQuestion, generateProposal, startAgentSession } from './proposalGenerator.js';
+import { answerAgentQuestion, generateProposal, normalizeAttachments, startAgentSession } from './proposalGenerator.js';
+import { findRelatedWork } from './relatedWork.js';
 
 const app = express();
 const port = Number(process.env.PORT || 8787);
 
 app.use(cors({ origin: process.env.CORS_ORIGIN || true }));
-app.use(express.json({ limit: '1mb' }));
+// Larger limit allows base64-encoded PDF attachments (up to 5 papers).
+app.use(express.json({ limit: '30mb' }));
 
 app.get('/api/health', (_request, response) => {
   response.json({
@@ -48,6 +50,31 @@ app.post('/api/agent/answer', async (request, response) => {
   } catch (error) {
     response.status(500).json({
       error: 'Answer integration failed.',
+      detail: error instanceof Error ? error.message : String(error)
+    });
+  }
+});
+
+app.post('/api/related-work', async (request, response) => {
+  try {
+    const payload = request.body || {};
+    const idea = String(payload.topic || payload.idea || '').trim();
+
+    if (!idea) {
+      response.status(400).json({ error: 'Topic is required.' });
+      return;
+    }
+
+    const result = await findRelatedWork({
+      idea,
+      attachments: normalizeAttachments(payload.attachments),
+      project: payload.project || {}
+    });
+
+    response.json(result);
+  } catch (error) {
+    response.status(500).json({
+      error: 'Related-work retrieval failed.',
       detail: error instanceof Error ? error.message : String(error)
     });
   }

@@ -106,6 +106,7 @@ First infer concrete proposal data from the rough idea. Give the user suggested 
 export async function startAgentSession(payload) {
   const project = normalizePayload(payload);
   const checklist = extractChecklist(project.requirements || DEFAULT_REQUIREMENTS);
+  const attachments = normalizeAttachments(payload.attachments);
 
   if (process.env.LLM_API_KEY && process.env.LLM_API_URL) {
     const result = await refineProjectWithApi({
@@ -113,7 +114,8 @@ export async function startAgentSession(payload) {
       project,
       checklist,
       activeQuestion: null,
-      answer: ''
+      answer: '',
+      attachments
     });
 
     return {
@@ -216,7 +218,8 @@ async function refineProjectWithApi(payload) {
     systemPrompt: QUESTION_SYSTEM_PROMPT,
     payload,
     model,
-    temperature: 0.2
+    temperature: 0.2,
+    attachments: payload.attachments
   });
   const parsed = parseJsonContent(content);
   const nextProject = mergeProject(payload.project, normalizePayload(parsed.project || {}));
@@ -277,17 +280,39 @@ async function generateWithApi(project, checklist) {
   };
 }
 
-async function callModel({ systemPrompt, payload, model, temperature }) {
+// Reusable JSON-mode LLM call for other modules (e.g. related-work ranking).
+export async function runLlm({ systemPrompt, payload, attachments = [], temperature = 0.2 }) {
+  if (!process.env.LLM_API_KEY || !process.env.LLM_API_URL) {
+    throw new Error('LLM is not configured.');
+  }
+
+  const model = clean(process.env.LLM_MODEL);
+  if (!model) {
+    throw new Error('LLM_MODEL is required when LLM_API_KEY and LLM_API_URL are configured.');
+  }
+
+  return callModel({ systemPrompt, payload, model, temperature, attachments });
+}
+
+async function callModel({ systemPrompt, payload, model, temperature, attachments = [] }) {
   if (getProvider() === 'gemini') {
-    return callGemini({ systemPrompt, payload, model, temperature });
+    return callGemini({ systemPrompt, payload, model, temperature, attachments });
   }
 
   return callOpenAiCompatible({ systemPrompt, payload, model, temperature });
 }
 
-async function callGemini({ systemPrompt, payload, model, temperature }) {
+async function callGemini({ systemPrompt, payload, model, temperature, attachments = [] }) {
   const baseUrl = clean(process.env.LLM_API_URL) || 'https://generativelanguage.googleapis.com/v1beta';
   const endpoint = `${baseUrl.replace(/\/$/, '')}/models/${encodeURIComponent(model)}:generateContent`;
+
+  const userParts = [{ text: JSON.stringify(payload, null, 2) }];
+  for (const attachment of attachments) {
+    if (attachment?.data && attachment?.mimeType) {
+      userParts.push({ inline_data: { mime_type: attachment.mimeType, data: attachment.data } });
+    }
+  }
+
   const response = await fetch(endpoint, {
     method: 'POST',
     headers: {
@@ -301,7 +326,7 @@ async function callGemini({ systemPrompt, payload, model, temperature }) {
       contents: [
         {
           role: 'user',
-          parts: [{ text: JSON.stringify(payload, null, 2) }]
+          parts: userParts
         }
       ],
       generationConfig: {
@@ -878,6 +903,19 @@ function mergeField(current, addition) {
   if (!next) return base;
   if (base.toLowerCase().includes(next.toLowerCase())) return base;
   return `${base}\n${next}`;
+}
+
+export function normalizeAttachments(attachments) {
+  if (!Array.isArray(attachments)) return [];
+
+  return attachments
+    .map((item) => ({
+      name: clean(item?.name),
+      mimeType: clean(item?.mimeType) || 'application/pdf',
+      data: clean(item?.data)
+    }))
+    .filter((item) => item.data)
+    .slice(0, 5);
 }
 
 function normalizePayload(payload) {

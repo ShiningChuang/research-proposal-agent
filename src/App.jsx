@@ -1,15 +1,19 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
+  BookOpen,
   CheckCircle2,
   ClipboardCheck,
   Download,
+  ExternalLink,
   FileText,
   ListChecks,
   Loader2,
+  Paperclip,
   Play,
   RefreshCw,
   Send,
-  Sparkles
+  Sparkles,
+  X
 } from 'lucide-react';
 
 const DEFAULT_REQUIREMENTS = `Proposal must include:
@@ -66,6 +70,9 @@ const MEMORY_KEY = 'proposal-agent-final-project-memory-v1';
 
 function App() {
   const [topicInput, setTopicInput] = useState('');
+  const [papers, setPapers] = useState([]);
+  const [relatedWork, setRelatedWork] = useState(null);
+  const [relatedStatus, setRelatedStatus] = useState('idle');
   const [project, setProject] = useState(EMPTY_PROJECT);
   const [fieldSuggestions, setFieldSuggestions] = useState([]);
   const [decisions, setDecisions] = useState([]);
@@ -142,10 +149,20 @@ function App() {
     setError('');
     clearArtifacts();
 
+    const attachments = papers.map((paper) => ({
+      name: paper.name,
+      mimeType: paper.mimeType,
+      data: paper.data
+    }));
+
+    // Kick off real related-work retrieval in parallel; it does not block Extract.
+    fetchRelatedWork(nextTopic, attachments);
+
     try {
       const data = await postJson('/api/agent/start', {
         topic: nextTopic,
-        requirements: DEFAULT_REQUIREMENTS
+        requirements: DEFAULT_REQUIREMENTS,
+        attachments
       });
 
       setProject({ ...EMPTY_PROJECT, ...data.project });
@@ -164,6 +181,64 @@ function App() {
     } finally {
       setStatus('idle');
     }
+  }
+
+  async function fetchRelatedWork(idea, attachments) {
+    if (!String(idea || '').trim()) return;
+
+    setRelatedStatus('loading');
+    setRelatedWork(null);
+
+    try {
+      const data = await postJson('/api/related-work', {
+        topic: idea,
+        project,
+        attachments: attachments || []
+      });
+      setRelatedWork(data);
+    } catch (requestError) {
+      setRelatedWork({ top: [], error: readError(requestError) });
+    } finally {
+      setRelatedStatus('idle');
+    }
+  }
+
+  async function handlePaperUpload(event) {
+    const selected = Array.from(event.target.files || []);
+    event.target.value = '';
+    if (!selected.length) return;
+
+    const room = Math.max(0, 5 - papers.length);
+    if (room === 0) {
+      setError('You can attach at most 5 papers.');
+      return;
+    }
+
+    const accepted = [];
+    for (const file of selected.slice(0, room)) {
+      if (file.type !== 'application/pdf') {
+        setError(`Skipped ${file.name}: only PDF files are supported.`);
+        continue;
+      }
+      try {
+        accepted.push({
+          name: file.name,
+          mimeType: file.type,
+          size: file.size,
+          data: await readFileAsBase64(file)
+        });
+      } catch {
+        setError(`Could not read ${file.name}.`);
+      }
+    }
+
+    if (accepted.length) {
+      setPapers((current) => [...current, ...accepted].slice(0, 5));
+    }
+  }
+
+  function removePaper(name) {
+    setPapers((current) => current.filter((paper) => paper.name !== name));
   }
 
   async function submitCustomNote() {
@@ -292,6 +367,9 @@ function App() {
 
   function reset() {
     setTopicInput('');
+    setPapers([]);
+    setRelatedWork(null);
+    setRelatedStatus('idle');
     setProject(EMPTY_PROJECT);
     setFieldSuggestions([]);
     setDecisions([]);
@@ -445,6 +523,40 @@ function App() {
             </div>
           </div>
 
+          <div className="paper-uploader">
+            <div className="paper-uploader-head">
+              <div>
+                <strong>Reference Papers</strong>
+                <span>Optional. Attach up to 5 PDFs you have read to ground retrieval and understanding.</span>
+              </div>
+              <label className="secondary upload-button">
+                <Paperclip size={16} aria-hidden="true" />
+                Attach PDF
+                <input
+                  type="file"
+                  accept="application/pdf"
+                  multiple
+                  hidden
+                  disabled={papers.length >= 5}
+                  onChange={handlePaperUpload}
+                />
+              </label>
+            </div>
+            {papers.length ? (
+              <ul className="paper-chip-list">
+                {papers.map((paper) => (
+                  <li className="paper-chip" key={paper.name}>
+                    <FileText size={14} aria-hidden="true" />
+                    <span title={paper.name}>{paper.name}</span>
+                    <button type="button" aria-label={`Remove ${paper.name}`} onClick={() => removePaper(paper.name)}>
+                      <X size={13} aria-hidden="true" />
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </div>
+
           <div className="memory-bar">
             <div>
               <strong>Memory</strong>
@@ -480,6 +592,8 @@ function App() {
               </article>
             ))}
           </div>
+
+          <RelatedWorkPanel relatedWork={relatedWork} status={relatedStatus} />
 
           <div className="workspace-grid">
             <section className="workspace-panel suggestions-panel">
@@ -725,6 +839,18 @@ function App() {
   );
 }
 
+function readFileAsBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result || '');
+      resolve(result.includes(',') ? result.split(',')[1] : result);
+    };
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
+}
+
 async function postJson(url, body) {
   const response = await fetch(url, {
     method: 'POST',
@@ -806,6 +932,97 @@ function renderArtifact(activeTab, result, pdfUrl) {
   }
 
   return <pre className="proposal-output">{result.proposalLatex}</pre>;
+}
+
+function RelatedWorkPanel({ relatedWork, status }) {
+  const papers = relatedWork?.top || [];
+  const isLoading = status === 'loading';
+
+  return (
+    <section className="related-work">
+      <div className="panel-header">
+        <h2>
+          <BookOpen size={18} aria-hidden="true" /> Related Work (Real Retrieval)
+        </h2>
+        <span>
+          {isLoading
+            ? 'Searching arXiv + Semantic Scholar…'
+            : relatedWork
+              ? `Top ${papers.length} · ${relatedWork.mode || 'ranked'}`
+              : 'Runs on Structure Idea'}
+        </span>
+      </div>
+
+      {isLoading ? (
+        <div className="related-loading">
+          <Loader2 className="spin" size={20} aria-hidden="true" />
+          <p>Retrieving real papers and scoring relevance…</p>
+        </div>
+      ) : !relatedWork ? (
+        <EmptyState text="Click Structure Idea to retrieve real related papers from arXiv and Semantic Scholar." compact />
+      ) : papers.length ? (
+        <>
+          <div className="related-grid">
+            {papers.map((paper, index) => (
+              <RelatedPaperCard key={`${paper.title}-${index}`} paper={paper} rank={index + 1} />
+            ))}
+          </div>
+          <p className="related-foot">
+            Sources — arXiv: {relatedWork.sources?.arxiv || 'n/a'} · Semantic Scholar: {relatedWork.sources?.semanticScholar || 'n/a'}.
+            Influence and freshness come from real metadata; relevance is model-scored. Links are real; verify before citing.
+          </p>
+        </>
+      ) : (
+        <EmptyState
+          text={relatedWork.error
+            ? `Retrieval failed: ${relatedWork.error}`
+            : 'No papers found. Try a more specific idea or attach reference PDFs.'}
+          compact
+        />
+      )}
+    </section>
+  );
+}
+
+function RelatedPaperCard({ paper, rank }) {
+  return (
+    <article className="paper-card">
+      <div className="paper-card-top">
+        <span className="paper-rank">#{rank}</span>
+        <span className="paper-overall" title="Combined score">{paper.score}</span>
+      </div>
+      <h3>
+        {paper.url ? (
+          <a href={paper.url} target="_blank" rel="noreferrer">
+            {paper.title} <ExternalLink size={13} aria-hidden="true" />
+          </a>
+        ) : (
+          paper.title
+        )}
+      </h3>
+      <p className="paper-meta">
+        {[paper.venue || paper.source, paper.year, paper.citationCount != null ? `${paper.citationCount} cites` : null]
+          .filter(Boolean)
+          .join(' · ')}
+      </p>
+      {paper.rationale ? <p className="paper-rationale">{paper.rationale}</p> : null}
+      <div className="paper-scores">
+        <ScoreBadge label="Relevance" value={paper.relevance} />
+        <ScoreBadge label="Influence" value={paper.influence} />
+        <ScoreBadge label="Freshness" value={paper.freshness} />
+      </div>
+    </article>
+  );
+}
+
+function ScoreBadge({ label, value }) {
+  const tier = value >= 67 ? 'high' : value >= 34 ? 'mid' : 'low';
+  return (
+    <span className={`score-badge ${tier}`}>
+      <small>{label}</small>
+      <strong>{value}</strong>
+    </span>
+  );
 }
 
 function PanelHeader({ title, meta }) {
