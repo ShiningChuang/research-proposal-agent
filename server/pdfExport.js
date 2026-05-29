@@ -19,7 +19,7 @@ export async function proposalLatexToPdf(latex, title = 'proposal') {
 
   try {
     await writeFile(texPath, sanitizeLatexForExport(ensureCompleteLatexDocument(source, title)), 'utf8');
-    await execFileAsync('tectonic', ['--outdir', workdir, texPath], {
+    await execFileAsync('pdflatex', ['-interaction=nonstopmode', '-output-directory', workdir, texPath], {
       cwd: workdir,
       timeout: 60000,
       maxBuffer: 1024 * 1024 * 8
