@@ -2,7 +2,15 @@ import 'dotenv/config';
 import cors from 'cors';
 import express from 'express';
 import { proposalLatexToPdf } from './pdfExport.js';
-import { answerAgentQuestion, generateProposal, normalizeAttachments, startAgentSession } from './proposalGenerator.js';
+import {
+  answerAgentQuestion,
+  generateProposal,
+  generateQuestions,
+  getConfiguredProviders,
+  normalizeAttachments,
+  regenerateField,
+  startAgentSession
+} from './proposalGenerator.js';
 import { findRelatedWork } from './relatedWork.js';
 
 const app = express();
@@ -13,9 +21,11 @@ app.use(cors({ origin: process.env.CORS_ORIGIN || true }));
 app.use(express.json({ limit: '30mb' }));
 
 app.get('/api/health', (_request, response) => {
+  const providers = getConfiguredProviders();
   response.json({
     ok: true,
-    mode: process.env.LLM_API_KEY ? 'api-ready' : 'local-fallback'
+    mode: providers.gemini || providers.openrouter ? 'api-ready' : 'local-fallback',
+    providers
   });
 });
 
@@ -55,6 +65,36 @@ app.post('/api/agent/answer', async (request, response) => {
   }
 });
 
+app.post('/api/agent/questions', async (request, response) => {
+  try {
+    const payload = request.body || {};
+    response.json(await generateQuestions(payload));
+  } catch (error) {
+    response.status(500).json({
+      error: 'Question generation failed.',
+      detail: error instanceof Error ? error.message : String(error)
+    });
+  }
+});
+
+app.post('/api/agent/field', async (request, response) => {
+  try {
+    const payload = request.body || {};
+
+    if (!String(payload.field || '').trim()) {
+      response.status(400).json({ error: 'field is required.' });
+      return;
+    }
+
+    response.json(await regenerateField(payload));
+  } catch (error) {
+    response.status(500).json({
+      error: 'Field regeneration failed.',
+      detail: error instanceof Error ? error.message : String(error)
+    });
+  }
+});
+
 app.post('/api/related-work', async (request, response) => {
   try {
     const payload = request.body || {};
@@ -68,7 +108,8 @@ app.post('/api/related-work', async (request, response) => {
     const result = await findRelatedWork({
       idea,
       attachments: normalizeAttachments(payload.attachments),
-      project: payload.project || {}
+      project: payload.project || {},
+      provider: payload.provider
     });
 
     response.json(result);

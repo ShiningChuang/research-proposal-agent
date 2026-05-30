@@ -11,7 +11,6 @@ import {
   Paperclip,
   Play,
   RefreshCw,
-  Send,
   Sparkles,
   X
 } from 'lucide-react';
@@ -70,14 +69,19 @@ const MEMORY_KEY = 'proposal-agent-final-project-memory-v1';
 
 function App() {
   const [topicInput, setTopicInput] = useState('');
+  const [provider, setProvider] = useState(() => localStorage.getItem('proposal-agent-provider') || 'gemini');
+  const [providerInfo, setProviderInfo] = useState({ gemini: true, openrouter: true });
   const [papers, setPapers] = useState([]);
   const [relatedWork, setRelatedWork] = useState(null);
   const [relatedStatus, setRelatedStatus] = useState('idle');
+  const [fieldAdvice, setFieldAdvice] = useState({});
+  const [regenField, setRegenField] = useState('');
   const [project, setProject] = useState(EMPTY_PROJECT);
   const [fieldSuggestions, setFieldSuggestions] = useState([]);
   const [decisions, setDecisions] = useState([]);
+  const [answeredDecisions, setAnsweredDecisions] = useState({});
+  const [otherDrafts, setOtherDrafts] = useState({});
   const [questions, setQuestions] = useState([]);
-  const [customNote, setCustomNote] = useState('');
   const [result, setResult] = useState(null);
   const [pdfUrl, setPdfUrl] = useState('');
   const [runLog, setRunLog] = useState([]);
@@ -99,12 +103,26 @@ function App() {
   const acceptedSuggestionCount = fieldSuggestions.filter((suggestion) => project[suggestion.field] === suggestion.value).length;
   const currentSuggestion = fieldSuggestions[suggestionIndex] || null;
   const currentDecision = decisions[decisionIndex] || null;
-  const currentQuestion = questions[0];
+  const sessionActive = Boolean(fieldSuggestions.length || decisions.length || result);
+  const providerLocked = sessionActive || status !== 'idle';
 
   useEffect(() => {
     loadSavedMemory({ silent: true });
     setMemoryReady(true);
+
+    fetch('/api/health')
+      .then((response) => response.json())
+      .then((data) => {
+        if (data?.providers) setProviderInfo(data.providers);
+      })
+      .catch(() => {});
   }, []);
+
+  function changeProvider(next) {
+    if (providerLocked) return;
+    setProvider(next);
+    localStorage.setItem('proposal-agent-provider', next);
+  }
 
   useEffect(() => {
     return () => {
@@ -162,20 +180,24 @@ function App() {
       const data = await postJson('/api/agent/start', {
         topic: nextTopic,
         requirements: DEFAULT_REQUIREMENTS,
-        attachments
+        attachments,
+        provider
       });
 
       setProject({ ...EMPTY_PROJECT, ...data.project });
       setFieldSuggestions(data.fieldSuggestions || []);
-      setDecisions(data.decisions || []);
-      setQuestions(data.questions || []);
+      // Decisions are NOT generated from the rough idea. They come later, after the
+      // project state is defined, via "Generate Questions".
+      setDecisions([]);
+      setQuestions([]);
+      setAnsweredDecisions({});
+      setOtherDrafts({});
       setSuggestionIndex(0);
       setDecisionIndex(0);
       setRunLog([
         logEntry('Extract', data.runMessage || 'LLM prepared structured suggestions.'),
-        logEntry('Decide', `Review ${(data.fieldSuggestions || []).length} fields and ${(data.decisions || []).length} decision card(s).`)
+        logEntry('Decide', `Review and accept ${(data.fieldSuggestions || []).length} suggested field(s), then Generate Questions.`)
       ]);
-      setCustomNote('');
     } catch (requestError) {
       setError(readError(requestError));
     } finally {
@@ -193,7 +215,8 @@ function App() {
       const data = await postJson('/api/related-work', {
         topic: idea,
         project,
-        attachments: attachments || []
+        attachments: attachments || [],
+        provider
       });
       setRelatedWork(data);
     } catch (requestError) {
@@ -241,46 +264,6 @@ function App() {
     setPapers((current) => current.filter((paper) => paper.name !== name));
   }
 
-  async function submitCustomNote() {
-    const trimmed = customNote.trim();
-    if (!trimmed) return;
-
-    setStatus('answering');
-    setError('');
-
-    try {
-      const data = await postJson('/api/agent/answer', {
-        project,
-        question: currentQuestion || {
-          field: 'method',
-          question: 'Integrate this user note into the project state.',
-          reason: 'The user provided a custom refinement.',
-          priority: 'Medium'
-        },
-        answer: trimmed,
-        requirements: DEFAULT_REQUIREMENTS
-      });
-
-      setProject({ ...EMPTY_PROJECT, ...data.project });
-      setFieldSuggestions(data.fieldSuggestions || []);
-      setDecisions(data.decisions || []);
-      setQuestions(data.questions || []);
-      setSuggestionIndex(0);
-      setDecisionIndex(0);
-      setRunLog((current) => [
-        ...current,
-        logEntry('Update', data.runMessage || 'Integrated custom note.'),
-        logEntry('Decide', `Refreshed ${(data.fieldSuggestions || []).length} suggested field(s).`)
-      ]);
-      setCustomNote('');
-      clearArtifacts();
-    } catch (requestError) {
-      setError(readError(requestError));
-    } finally {
-      setStatus('idle');
-    }
-  }
-
   async function generateProposal() {
     setStatus('drafting');
     setError('');
@@ -289,7 +272,8 @@ function App() {
       const data = await postJson('/api/proposal', {
         ...project,
         topic: project.topic || project.title,
-        requirements: DEFAULT_REQUIREMENTS
+        requirements: DEFAULT_REQUIREMENTS,
+        provider
       });
       const nextPdfUrl = await exportPdfUrl(data.proposalLatex, project.title || 'proposal');
 
@@ -305,6 +289,46 @@ function App() {
       setError(readError(requestError));
     } finally {
       setStatus('idle');
+    }
+  }
+
+  async function submitFieldSuggestion(suggestion) {
+    const advice = (fieldAdvice[suggestion.field] || '').trim();
+    if (!advice || regenField) return;
+
+    setRegenField(suggestion.field);
+    setError('');
+
+    try {
+      const data = await postJson('/api/agent/field', {
+        field: suggestion.field,
+        project,
+        suggestion: advice,
+        requirements: DEFAULT_REQUIREMENTS,
+        provider
+      });
+
+      setFieldSuggestions((current) =>
+        current.map((item) =>
+          item.field === suggestion.field
+            ? {
+                ...item,
+                value: data.value,
+                confidence: data.confidence || item.confidence,
+                reason: data.reason || item.reason
+              }
+            : item
+        )
+      );
+      setFieldAdvice((current) => ({ ...current, [suggestion.field]: '' }));
+      setRunLog((current) => [
+        ...current,
+        logEntry('Refine', `Regenerated ${suggestion.label || suggestion.field} from your suggestion.`)
+      ]);
+    } catch (requestError) {
+      setError(readError(requestError));
+    } finally {
+      setRegenField('');
     }
   }
 
@@ -324,14 +348,46 @@ function App() {
     setSuggestionIndex((current) => Math.min(current + 1, Math.max(fieldSuggestions.length - 1, 0)));
   }
 
+  async function generateQuestions() {
+    setStatus('questioning');
+    setError('');
+
+    try {
+      const data = await postJson('/api/agent/questions', {
+        project,
+        requirements: DEFAULT_REQUIREMENTS,
+        provider
+      });
+      const nextDecisions = data.decisions || [];
+      setDecisions(nextDecisions);
+      setDecisionIndex(0);
+      setAnsweredDecisions({});
+      setOtherDrafts({});
+      setRunLog((current) => [
+        ...current,
+        logEntry('Questions', `Generated ${nextDecisions.length} open question(s) from the project state.`)
+      ]);
+    } catch (requestError) {
+      setError(readError(requestError));
+    } finally {
+      setStatus('idle');
+    }
+  }
+
   function chooseOption(decision, option) {
     updateProjectField(decision.field, option.value);
-    setDecisions((current) => {
-      const next = current.filter((item) => item.id !== decision.id);
-      setDecisionIndex((index) => Math.min(index, Math.max(next.length - 1, 0)));
-      return next;
-    });
+    setAnsweredDecisions((current) => ({ ...current, [decision.id]: option.label }));
     setRunLog((current) => [...current, logEntry('Decision', `Selected ${option.label} for ${decision.title}.`)]);
+    advanceDecision();
+  }
+
+  function chooseOther(decision) {
+    const text = (otherDrafts[decision.id] || '').trim();
+    if (!text) return;
+    updateProjectField(decision.field, text);
+    setAnsweredDecisions((current) => ({ ...current, [decision.id]: 'Other' }));
+    setRunLog((current) => [...current, logEntry('Decision', `Custom answer for ${decision.title}.`)]);
+    advanceDecision();
   }
 
   function skipDecision() {
@@ -370,11 +426,14 @@ function App() {
     setPapers([]);
     setRelatedWork(null);
     setRelatedStatus('idle');
+    setFieldAdvice({});
+    setRegenField('');
     setProject(EMPTY_PROJECT);
     setFieldSuggestions([]);
     setDecisions([]);
+    setAnsweredDecisions({});
+    setOtherDrafts({});
     setQuestions([]);
-    setCustomNote('');
     clearArtifacts();
     setRunLog([]);
     setError('');
@@ -487,11 +546,34 @@ function App() {
     <main className="app-shell">
       <header className="topbar">
         <h1>Research Proposal Agent</h1>
+        <div className="provider-switch" role="group" aria-label="Model provider">
+          <button
+            type="button"
+            className={provider === 'gemini' ? 'active' : ''}
+            disabled={providerLocked || !providerInfo.gemini}
+            onClick={() => changeProvider('gemini')}
+            title={providerInfo.gemini ? 'Use Gemini' : 'Gemini not configured in .env'}
+          >
+            Gemini
+          </button>
+          <button
+            type="button"
+            className={provider === 'openrouter' ? 'active' : ''}
+            disabled={providerLocked || !providerInfo.openrouter}
+            onClick={() => changeProvider('openrouter')}
+            title={providerInfo.openrouter ? 'Use OpenRouter' : 'OpenRouter not configured in .env'}
+          >
+            OpenRouter
+          </button>
+        </div>
         <span className="status-pill">
           <Sparkles size={16} aria-hidden="true" />
           {result?.mode || (fieldSuggestions.length ? 'structuring' : 'ready')}
         </span>
       </header>
+      {providerLocked ? (
+        <p className="provider-hint">Model locked to <strong>{provider}</strong> for this session. Press Reset to switch.</p>
+      ) : null}
 
       <section className="workspace single-pane">
         <section className="workflow-artifact">
@@ -614,6 +696,28 @@ function App() {
                       </div>
                       <p>{currentSuggestion.value}</p>
                       <small>{currentSuggestion.reason}</small>
+                      <div className="field-advice">
+                        <textarea
+                          value={fieldAdvice[currentSuggestion.field] || ''}
+                          placeholder={`Suggest how to improve ${currentSuggestion.label || labelForField(currentSuggestion.field)}, then regenerate just this section…`}
+                          onChange={(event) =>
+                            setFieldAdvice((current) => ({ ...current, [currentSuggestion.field]: event.target.value }))
+                          }
+                        />
+                        <button
+                          className="secondary"
+                          type="button"
+                          disabled={!(fieldAdvice[currentSuggestion.field] || '').trim() || Boolean(regenField)}
+                          onClick={() => submitFieldSuggestion(currentSuggestion)}
+                        >
+                          {regenField === currentSuggestion.field ? (
+                            <Loader2 className="spin" size={15} aria-hidden="true" />
+                          ) : (
+                            <Sparkles size={15} aria-hidden="true" />
+                          )}
+                          Submit Suggestion
+                        </button>
+                      </div>
                       <div className="deck-actions">
                         <button
                           className={project[currentSuggestion.field] === currentSuggestion.value ? 'secondary accepted' : 'primary'}
@@ -668,87 +772,6 @@ function App() {
               )}
             </section>
 
-            <section className="workspace-panel decisions-panel">
-              <PanelHeader title="Decision Needed" meta={`${decisions.length} open`} />
-              {decisions.length ? (
-                <div className="decision-deck">
-                  <div className="deck-progress">
-                    <span>{Math.min(decisionIndex + 1, decisions.length)} / {decisions.length}</span>
-                    <strong>{decisions.length} open</strong>
-                  </div>
-                  {currentDecision ? (
-                    <article className="decision-card active-card" key={currentDecision.id}>
-                      <h3>{currentDecision.title}</h3>
-                      <p>{currentDecision.question}</p>
-                      <div className="option-stack">
-                        {currentDecision.options.map((option) => (
-                          <button
-                            className="option-button"
-                            key={`${currentDecision.id}-${option.label}`}
-                            type="button"
-                            onClick={() => chooseOption(currentDecision, option)}
-                          >
-                            <strong>{option.label}</strong>
-                            <span>{option.value}</span>
-                            <small>{option.rationale}</small>
-                          </button>
-                        ))}
-                      </div>
-                      <div className="deck-actions">
-                        <button className="secondary" type="button" onClick={skipDecision}>
-                          Skip
-                        </button>
-                      </div>
-                    </article>
-                  ) : null}
-                  <div className="deck-nav">
-                    <button
-                      className="secondary"
-                      type="button"
-                      disabled={decisionIndex === 0}
-                      onClick={() => setDecisionIndex((current) => Math.max(current - 1, 0))}
-                    >
-                      Previous
-                    </button>
-                    <button
-                      className="secondary"
-                      type="button"
-                      disabled={decisionIndex >= decisions.length - 1}
-                      onClick={() => setDecisionIndex((current) => Math.min(current + 1, decisions.length - 1))}
-                    >
-                      Next
-                    </button>
-                  </div>
-                  <div className="deck-strip" aria-label="Decision progress">
-                    {decisions.map((decision, index) => (
-                      <button
-                        key={`${decision.id}-${index}`}
-                        className={['deck-dot', index === decisionIndex ? 'current' : ''].join(' ')}
-                        type="button"
-                        aria-label={`Open ${decision.title}`}
-                        onClick={() => setDecisionIndex(index)}
-                      />
-                    ))}
-                  </div>
-                </div>
-              ) : (
-                <EmptyState text="No major decision is open. Review the accepted state or draft the proposal." compact />
-              )}
-
-              <section className="custom-note">
-                <h3>Extra Note</h3>
-                <textarea
-                  value={customNote}
-                  onChange={(event) => setCustomNote(event.target.value)}
-                  placeholder={currentQuestion?.question || 'Add a detail the options missed.'}
-                />
-                <button className="primary" disabled={!customNote.trim() || status !== 'idle'} onClick={submitCustomNote} type="button">
-                  {status === 'answering' ? <Loader2 className="spin" size={16} aria-hidden="true" /> : <Send size={16} aria-hidden="true" />}
-                  Let LLM Integrate
-                </button>
-              </section>
-            </section>
-
             <section className="workspace-panel state-panel">
               <PanelHeader title="Accepted Project State" meta={`${acceptedCount}/${PROJECT_FIELDS.length} ready`} />
               <label>
@@ -761,12 +784,123 @@ function App() {
                   <textarea value={project[field] || ''} onChange={(event) => updateProjectField(field, event.target.value)} />
                 </label>
               ))}
-              <button className="primary" disabled={!project.title || status !== 'idle'} onClick={generateProposal} type="button">
-                {status === 'drafting' ? <Loader2 className="spin" size={16} aria-hidden="true" /> : <FileText size={16} aria-hidden="true" />}
-                Generate Proposal
+              <button className="primary" disabled={!project.title || status !== 'idle'} onClick={generateQuestions} type="button">
+                {status === 'questioning' ? <Loader2 className="spin" size={16} aria-hidden="true" /> : <ListChecks size={16} aria-hidden="true" />}
+                Generate Questions
               </button>
             </section>
           </div>
+
+          <section className="workspace-panel decisions-panel decisions-row">
+            <div className="panel-header">
+              <h2>Decision Needed</h2>
+              <span>{decisions.length ? `${decisionIndex + 1} / ${decisions.length}` : '0 open'}</span>
+            </div>
+            {decisions.length ? (
+              <div className="decision-deck">
+                {currentDecision ? (
+                  <article className="decision-card active-card" key={currentDecision.id}>
+                    <div className="card-line">
+                      <h3>{currentDecision.title}</h3>
+                      {answeredDecisions[currentDecision.id] ? (
+                        <span className="priority low">Answered: {answeredDecisions[currentDecision.id]}</span>
+                      ) : null}
+                    </div>
+                    <p>{currentDecision.question}</p>
+                    <div className="option-tiles">
+                      {currentDecision.options.map((option) => (
+                        <button
+                          className="option-button"
+                          key={`${currentDecision.id}-${option.label}`}
+                          type="button"
+                          onClick={() => chooseOption(currentDecision, option)}
+                        >
+                          <strong>{option.label}</strong>
+                          <span>{option.value}</span>
+                          <small>{option.rationale}</small>
+                        </button>
+                      ))}
+                      <div className="option-button other-tile">
+                        <strong>Other</strong>
+                        <textarea
+                          value={otherDrafts[currentDecision.id] || ''}
+                          placeholder="Answer in your own words…"
+                          onChange={(event) =>
+                            setOtherDrafts((current) => ({ ...current, [currentDecision.id]: event.target.value }))
+                          }
+                        />
+                        <button
+                          className="secondary"
+                          type="button"
+                          disabled={!(otherDrafts[currentDecision.id] || '').trim()}
+                          onClick={() => chooseOther(currentDecision)}
+                        >
+                          <CheckCircle2 size={15} aria-hidden="true" /> Use this answer
+                        </button>
+                      </div>
+                    </div>
+                    <div className="deck-actions">
+                      <button className="secondary" type="button" onClick={skipDecision}>
+                        Skip
+                      </button>
+                    </div>
+                  </article>
+                ) : null}
+                <div className="deck-nav">
+                  <button
+                    className="secondary"
+                    type="button"
+                    disabled={decisionIndex === 0}
+                    onClick={() => setDecisionIndex((current) => Math.max(current - 1, 0))}
+                  >
+                    Previous
+                  </button>
+                  {decisionIndex >= decisions.length - 1 ? (
+                    <button className="primary" type="button" disabled={status !== 'idle'} onClick={generateProposal}>
+                      {status === 'drafting' ? <Loader2 className="spin" size={16} aria-hidden="true" /> : <FileText size={16} aria-hidden="true" />}
+                      Generate Proposal
+                    </button>
+                  ) : (
+                    <button
+                      className="secondary"
+                      type="button"
+                      onClick={() => setDecisionIndex((current) => Math.min(current + 1, decisions.length - 1))}
+                    >
+                      Next
+                    </button>
+                  )}
+                </div>
+                <div className="deck-strip" aria-label="Decision progress">
+                  {decisions.map((decision, index) => (
+                    <button
+                      key={`${decision.id}-${index}`}
+                      className={[
+                        'deck-dot',
+                        index === decisionIndex ? 'current' : '',
+                        answeredDecisions[decision.id] ? 'done' : ''
+                      ].join(' ')}
+                      type="button"
+                      aria-label={`Open ${decision.title}`}
+                      onClick={() => setDecisionIndex(index)}
+                    />
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div className="decisions-empty">
+                <EmptyState
+                  text="Accept your field suggestions first, then click Generate Questions to get open questions here."
+                  compact
+                />
+                {project.title ? (
+                  <button className="secondary" type="button" disabled={status !== 'idle'} onClick={generateProposal}>
+                    {status === 'drafting' ? <Loader2 className="spin" size={16} aria-hidden="true" /> : <FileText size={16} aria-hidden="true" />}
+                    Skip questions, generate proposal
+                  </button>
+                ) : null}
+              </div>
+            )}
+          </section>
 
           <div className="workflow-columns">
             <section className="workflow-panel">

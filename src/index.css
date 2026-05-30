@@ -73,6 +73,53 @@ h2 {
   font-weight: 850;
 }
 
+.provider-switch {
+  display: inline-flex;
+  border: 1px solid #c7d2d6;
+  border-radius: 999px;
+  padding: 3px;
+  background: #ffffff;
+  gap: 2px;
+}
+
+.provider-switch button {
+  border-radius: 999px;
+  padding: 6px 14px;
+  background: transparent;
+  color: #536066;
+  font-size: 0.82rem;
+  font-weight: 850;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.provider-switch button.active {
+  background: #2f6f62;
+  color: #ffffff;
+}
+
+.provider-switch button:disabled {
+  cursor: not-allowed;
+}
+
+.provider-switch button:disabled:not(.active) {
+  opacity: 0.4;
+}
+
+.provider-hint {
+  margin: 0;
+  padding: 8px 24px 0;
+  text-align: center;
+  color: #647177;
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.provider-hint strong {
+  color: #28584b;
+  text-transform: capitalize;
+}
+
 .workspace.single-pane {
   display: block;
   min-height: calc(100vh - 78px);
@@ -276,9 +323,46 @@ textarea:focus {
 
 .workspace-grid {
   display: grid;
-  grid-template-columns: minmax(270px, 0.95fr) minmax(320px, 1.15fr) minmax(320px, 1fr);
+  grid-template-columns: minmax(300px, 1fr) minmax(300px, 1fr);
   gap: 16px;
   align-items: start;
+}
+
+.decisions-row {
+  border: 1px solid #cbd7dc;
+  border-radius: 8px;
+  padding: 14px;
+  background: #ffffff;
+}
+
+.option-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 10px;
+}
+
+.other-tile {
+  cursor: default;
+}
+
+.other-tile:hover {
+  border-color: #c7d2d6;
+  background: #fbfdfd;
+}
+
+.other-tile textarea {
+  min-height: 54px;
+}
+
+.other-tile .secondary {
+  align-self: flex-start;
+}
+
+.decisions-empty {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  align-items: center;
 }
 
 .workspace-panel {
@@ -440,7 +524,7 @@ textarea:focus {
 
 .related-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
   gap: 12px;
 }
 
@@ -618,7 +702,6 @@ textarea:focus {
 
 .suggestion-card,
 .decision-card,
-.custom-note,
 .state-panel label {
   border: 1px solid #cbd7dc;
   border-radius: 8px;
@@ -626,8 +709,7 @@ textarea:focus {
 }
 
 .suggestion-card,
-.decision-card,
-.custom-note {
+.decision-card {
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -646,8 +728,7 @@ textarea:focus {
 }
 
 .suggestion-card h3,
-.decision-card h3,
-.custom-note h3 {
+.decision-card h3 {
   margin: 0;
   color: #1f2d32;
   font-size: 0.96rem;
@@ -733,8 +814,21 @@ textarea:focus {
   line-height: 1.38;
 }
 
-.custom-note textarea {
-  min-height: 94px;
+.field-advice {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border-top: 1px solid #e3eaed;
+  padding-top: 10px;
+}
+
+.field-advice textarea {
+  min-height: 60px;
+  background: #fbfdfd;
+}
+
+.field-advice .secondary {
+  align-self: flex-start;
 }
 
 .state-panel {

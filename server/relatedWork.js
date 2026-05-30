@@ -1,4 +1,4 @@
-import { runLlm } from './proposalGenerator.js';
+import { isLlmConfigured, runLlm } from './proposalGenerator.js';
 
 // Real related-work retrieval.
 // Papers come from arXiv API + Semantic Scholar API (real titles, links, citations).
@@ -32,7 +32,7 @@ Rules:
 - Use ONLY the provided candidates. Never invent papers, titles, or links.
 - The rationale must be specific to the paper's title/abstract and the idea.`;
 
-export async function findRelatedWork({ idea, attachments = [], project = {} }) {
+export async function findRelatedWork({ idea, attachments = [], project = {}, provider }) {
   const query = buildQuery(idea, project);
 
   if (!query) {
@@ -66,9 +66,9 @@ export async function findRelatedWork({ idea, attachments = [], project = {} }) 
 
   let mode = 'heuristic';
 
-  if (candidates.length && process.env.LLM_API_KEY && process.env.LLM_API_URL) {
+  if (candidates.length && isLlmConfigured(provider)) {
     try {
-      const rankings = await rankWithLlm(idea, candidates, attachments);
+      const rankings = await rankWithLlm(idea, candidates, attachments, provider);
       applyRelevance(candidates, rankings);
       mode = 'llm-ranked';
     } catch {
@@ -86,7 +86,7 @@ export async function findRelatedWork({ idea, attachments = [], project = {} }) 
 
   const top = candidates
     .sort((a, b) => b.score - a.score)
-    .slice(0, 5);
+    .slice(0, 4);
 
   return { query, mode, sources, count: candidates.length, top };
 }
@@ -96,7 +96,7 @@ function buildQuery(idea, project) {
   return raw.replace(/\.$/, '').slice(0, 220);
 }
 
-async function rankWithLlm(idea, candidates, attachments) {
+async function rankWithLlm(idea, candidates, attachments, provider) {
   const payload = {
     idea,
     candidates: candidates.map((paper, index) => ({
@@ -113,7 +113,8 @@ async function rankWithLlm(idea, candidates, attachments) {
     systemPrompt: RANK_SYSTEM_PROMPT,
     payload,
     attachments,
-    temperature: 0.1
+    temperature: 0.1,
+    provider
   });
 
   const parsed = JSON.parse(stripFence(content));

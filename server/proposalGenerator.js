@@ -107,15 +107,17 @@ export async function startAgentSession(payload) {
   const project = normalizePayload(payload);
   const checklist = extractChecklist(project.requirements || DEFAULT_REQUIREMENTS);
   const attachments = normalizeAttachments(payload.attachments);
+  const llm = resolveLlmConfig(payload.provider);
 
-  if (process.env.LLM_API_KEY && process.env.LLM_API_URL) {
+  if (llm) {
     const result = await refineProjectWithApi({
       task: 'start',
       project,
       checklist,
       activeQuestion: null,
       answer: '',
-      attachments
+      attachments,
+      llm
     });
 
     return {
@@ -155,14 +157,17 @@ export async function answerAgentQuestion(payload) {
   const checklist = extractChecklist(project.requirements || payload.requirements || DEFAULT_REQUIREMENTS);
   const activeQuestion = normalizeQuestion(payload.question);
   const answer = clean(payload.answer);
+  const llm = resolveLlmConfig(payload.provider);
 
-  if (process.env.LLM_API_KEY && process.env.LLM_API_URL) {
+  if (llm) {
     const result = await refineProjectWithApi({
       task: 'integrate-answer',
       project,
       checklist,
       activeQuestion,
-      answer
+      answer,
+      attachments: normalizeAttachments(payload.attachments),
+      llm
     });
 
     return {
@@ -195,31 +200,154 @@ export async function answerAgentQuestion(payload) {
   };
 }
 
+const FIELD_SYSTEM_PROMPT = `You are refining ONE section of a CS research proposal.
+
+You receive the full current project state, the name of the target field, the current content of that field, and the user's suggestion for how to improve it.
+
+Return strict JSON:
+{
+  "value": "the new, improved content for ONLY the target field",
+  "confidence": "High | Medium | Low",
+  "reason": "one short sentence on what you changed"
+}
+
+Rules:
+- Rewrite ONLY the target field. Never return other fields.
+- Incorporate the user's suggestion directly.
+- Keep the content concrete and specific to the project topic.
+- Plain prose, no markdown headers or section titles.`;
+
+const OPEN_QUESTIONS_SYSTEM_PROMPT = `You are reviewing a CS research proposal's current project state.
+
+The student has already defined the core fields (problem, method, evaluation, etc.). Now that the basics are set, generate a small set of OPEN decision points worth asking only at this stage — for example scope tradeoffs, evaluation design choices, baseline selection, dataset/workload choice, or deployment target.
+
+Return strict JSON:
+{
+  "decisions": [
+    {
+      "id": "short-stable-id",
+      "title": "decision title",
+      "field": "problem | method | timeline | evaluation | resources | references",
+      "question": "context-aware decision prompt grounded in the actual project state",
+      "options": [
+        { "label": "short option label", "value": "specific content to write into that field", "rationale": "when this option is the right fit" }
+      ]
+    }
+  ]
+}
+
+Rules:
+- Base every question on the ACTUAL current project state, not generic proposal advice.
+- Return 2 to 4 decisions. Each decision has 2 or 3 concrete options.
+- Each option's value must be specific and directly usable as that field's content.
+- Do not restate fields that are already well specified unless a real tradeoff remains.`;
+
+// Generate open questions/decisions AFTER the project state is defined.
+export async function generateQuestions(payload) {
+  const project = normalizePayload(payload.project || payload);
+  const checklist = extractChecklist(project.requirements || DEFAULT_REQUIREMENTS);
+  const llm = resolveLlmConfig(payload.provider);
+
+  if (llm) {
+    const content = await callModel({
+      systemPrompt: OPEN_QUESTIONS_SYSTEM_PROMPT,
+      payload: { project, checklist },
+      temperature: 0.3,
+      llm
+    });
+    const parsed = parseJsonContent(content);
+
+    return {
+      decisions: normalizeDecisions(parsed.decisions, project),
+      mode: 'api',
+      provider: `${llm.name} (${llm.model})`
+    };
+  }
+
+  return {
+    decisions: buildDecisionCards(project),
+    mode: 'local-fallback',
+    provider: 'template'
+  };
+}
+
+// Regenerate a single project field from the user's suggestion, without touching other fields.
+export async function regenerateField(payload) {
+  const field = clean(payload.field);
+  if (!field) {
+    throw new Error('field is required.');
+  }
+
+  const project = normalizePayload(payload.project || payload);
+  const userSuggestion = clean(payload.suggestion);
+  const llm = resolveLlmConfig(payload.provider);
+
+  if (llm) {
+    const promptPayload = {
+      field,
+      label: labelForField(field),
+      currentValue: project[field] || '',
+      userSuggestion,
+      project,
+      requirements: project.requirements || DEFAULT_REQUIREMENTS
+    };
+
+    const content = await callModel({
+      systemPrompt: FIELD_SYSTEM_PROMPT,
+      payload: promptPayload,
+      temperature: 0.3,
+      llm
+    });
+
+    const parsed = parseJsonContent(content);
+    const value = clean(parsed.value) || clean(parsed[field]) || project[field];
+
+    return {
+      field,
+      label: labelForField(field),
+      value,
+      confidence: clean(parsed.confidence) || 'Medium',
+      reason: clean(parsed.reason) || 'Regenerated from your suggestion.',
+      mode: 'api',
+      provider: `${llm.name} (${llm.model})`
+    };
+  }
+
+  const merged = mergeField(project[field], userSuggestion);
+  return {
+    field,
+    label: labelForField(field),
+    value: merged || project[field],
+    confidence: 'Medium',
+    reason: 'Merged your suggestion (local fallback).',
+    mode: 'local-fallback',
+    provider: 'template'
+  };
+}
+
 export async function generateProposal(payload) {
   const project = normalizePayload(payload);
   const requirements = project.requirements || DEFAULT_REQUIREMENTS;
   const checklist = extractChecklist(requirements);
+  const llm = resolveLlmConfig(payload.provider);
 
-  if (process.env.LLM_API_KEY && process.env.LLM_API_URL) {
-    return generateWithApi(project, checklist);
+  if (llm) {
+    return generateWithApi(project, checklist, llm);
   }
 
   return generateLocally(project, checklist);
 }
 
 async function refineProjectWithApi(payload) {
-  const model = clean(process.env.LLM_MODEL);
-
-  if (!model) {
-    throw new Error('LLM_MODEL is required when LLM_API_KEY and LLM_API_URL are configured.');
-  }
+  // Strip control fields so the API key and base64 PDFs never enter the prompt text.
+  const { llm, attachments, ...promptPayload } = payload;
 
   const content = await callModel({
     systemPrompt: QUESTION_SYSTEM_PROMPT,
-    payload,
-    model,
+    payload: promptPayload,
     temperature: 0.2,
-    attachments: payload.attachments
+    attachments,
+    llm
   });
   const parsed = parseJsonContent(content);
   const nextProject = mergeProject(payload.project, normalizePayload(parsed.project || {}));
@@ -229,7 +357,7 @@ async function refineProjectWithApi(payload) {
 
   return {
     mode: 'api',
-    provider: process.env.LLM_API_URL,
+    provider: `${llm.name} (${llm.model})`,
     project: nextProject,
     suggestedProject: nextProject,
     fieldSuggestions,
@@ -243,13 +371,7 @@ async function refineProjectWithApi(payload) {
   };
 }
 
-async function generateWithApi(project, checklist) {
-  const model = clean(process.env.LLM_MODEL);
-
-  if (!model) {
-    throw new Error('LLM_MODEL is required when LLM_API_KEY and LLM_API_URL are configured.');
-  }
-
+async function generateWithApi(project, checklist, llm) {
   const promptPayload = {
     project,
     checklist,
@@ -264,14 +386,14 @@ async function generateWithApi(project, checklist) {
   const content = await callModel({
     systemPrompt: SYSTEM_PROMPT,
     payload: promptPayload,
-    model,
-    temperature: 0.2
+    temperature: 0.2,
+    llm
   });
   const parsed = parseJsonContent(content);
 
   return {
     mode: 'api',
-    provider: process.env.LLM_API_URL,
+    provider: `${llm.name} (${llm.model})`,
     ...coerceResult(parsed, project, checklist),
     transcript: {
       prompt: promptPayload,
@@ -281,30 +403,30 @@ async function generateWithApi(project, checklist) {
 }
 
 // Reusable JSON-mode LLM call for other modules (e.g. related-work ranking).
-export async function runLlm({ systemPrompt, payload, attachments = [], temperature = 0.2 }) {
-  if (!process.env.LLM_API_KEY || !process.env.LLM_API_URL) {
+export async function runLlm({ systemPrompt, payload, attachments = [], temperature = 0.2, provider }) {
+  const llm = resolveLlmConfig(provider);
+  if (!llm) {
     throw new Error('LLM is not configured.');
   }
 
-  const model = clean(process.env.LLM_MODEL);
-  if (!model) {
-    throw new Error('LLM_MODEL is required when LLM_API_KEY and LLM_API_URL are configured.');
-  }
-
-  return callModel({ systemPrompt, payload, model, temperature, attachments });
+  return callModel({ systemPrompt, payload, temperature, attachments, llm });
 }
 
-async function callModel({ systemPrompt, payload, model, temperature, attachments = [] }) {
-  if (getProvider() === 'gemini') {
-    return callGemini({ systemPrompt, payload, model, temperature, attachments });
+async function callModel({ systemPrompt, payload, temperature, attachments = [], llm }) {
+  if (!llm) {
+    throw new Error('No LLM provider is configured.');
   }
 
-  return callOpenAiCompatible({ systemPrompt, payload, model, temperature });
+  if (llm.kind === 'gemini') {
+    return callGemini({ systemPrompt, payload, temperature, attachments, llm });
+  }
+
+  return callOpenAiCompatible({ systemPrompt, payload, temperature, llm });
 }
 
-async function callGemini({ systemPrompt, payload, model, temperature, attachments = [] }) {
-  const baseUrl = clean(process.env.LLM_API_URL) || 'https://generativelanguage.googleapis.com/v1beta';
-  const endpoint = `${baseUrl.replace(/\/$/, '')}/models/${encodeURIComponent(model)}:generateContent`;
+async function callGemini({ systemPrompt, payload, temperature, attachments = [], llm }) {
+  const baseUrl = llm.apiUrl || 'https://generativelanguage.googleapis.com/v1beta';
+  const endpoint = `${baseUrl.replace(/\/$/, '')}/models/${encodeURIComponent(llm.model)}:generateContent`;
 
   const userParts = [{ text: JSON.stringify(payload, null, 2) }];
   for (const attachment of attachments) {
@@ -317,7 +439,7 @@ async function callGemini({ systemPrompt, payload, model, temperature, attachmen
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'x-goog-api-key': process.env.LLM_API_KEY
+      'x-goog-api-key': llm.apiKey
     },
     body: JSON.stringify({
       systemInstruction: {
@@ -354,15 +476,18 @@ async function callGemini({ systemPrompt, payload, model, temperature, attachmen
   return content;
 }
 
-async function callOpenAiCompatible({ systemPrompt, payload, model, temperature }) {
-  const response = await fetch(process.env.LLM_API_URL, {
+async function callOpenAiCompatible({ systemPrompt, payload, temperature, llm }) {
+  const response = await fetch(llm.apiUrl, {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${process.env.LLM_API_KEY}`,
-      'Content-Type': 'application/json'
+      Authorization: `Bearer ${llm.apiKey}`,
+      'Content-Type': 'application/json',
+      // Optional OpenRouter attribution headers (harmless for other providers).
+      'HTTP-Referer': 'http://127.0.0.1:5174',
+      'X-Title': 'CS222 Proposal Agent'
     },
     body: JSON.stringify({
-      model,
+      model: llm.model,
       temperature,
       messages: [
         { role: 'system', content: systemPrompt },
@@ -1124,15 +1249,61 @@ function escapeLatex(value) {
     .replace(/\^/g, '\\textasciicircum{}');
 }
 
-function getProvider() {
-  const provider = clean(process.env.LLM_PROVIDER).toLowerCase();
-  const url = clean(process.env.LLM_API_URL).toLowerCase();
+// --- Provider resolution -------------------------------------------------
+// Each provider is configured independently in .env. A request may choose
+// which one to use ("gemini" | "openrouter"); the chosen one is resolved
+// here. Returns null when the requested (or any) provider is not configured.
 
-  if (provider === 'gemini' || url.includes('generativelanguage.googleapis.com')) {
-    return 'gemini';
+function geminiConfig() {
+  const apiKey = clean(process.env.GEMINI_API_KEY) || clean(process.env.LLM_API_KEY);
+  if (!apiKey) return null;
+  return {
+    name: 'gemini',
+    kind: 'gemini',
+    apiUrl: clean(process.env.GEMINI_API_URL) || 'https://generativelanguage.googleapis.com/v1beta',
+    apiKey,
+    model: clean(process.env.GEMINI_MODEL) || clean(process.env.LLM_MODEL) || 'gemini-2.5-flash'
+  };
+}
+
+function openrouterConfig() {
+  const apiKey = clean(process.env.OPENROUTER_API_KEY);
+  if (!apiKey) return null;
+  return {
+    name: 'openrouter',
+    kind: 'openai-compatible',
+    apiUrl: clean(process.env.OPENROUTER_API_URL) || 'https://openrouter.ai/api/v1/chat/completions',
+    apiKey,
+    model: clean(process.env.OPENROUTER_MODEL) || 'openai/gpt-4o-mini'
+  };
+}
+
+export function resolveLlmConfig(requested) {
+  const choice = clean(requested).toLowerCase();
+  const available = { gemini: geminiConfig(), openrouter: openrouterConfig() };
+
+  if (choice === 'gemini' && available.gemini) return available.gemini;
+  if (choice === 'openrouter' && available.openrouter) return available.openrouter;
+
+  // No (valid) explicit choice: fall back to the configured default, then any.
+  const fallbackOrder = [clean(process.env.LLM_DEFAULT_PROVIDER).toLowerCase(), 'gemini', 'openrouter'];
+  for (const name of fallbackOrder) {
+    if (available[name]) return available[name];
   }
 
-  return 'openai-compatible';
+  return null;
+}
+
+export function isLlmConfigured(requested) {
+  return Boolean(resolveLlmConfig(requested));
+}
+
+export function getConfiguredProviders() {
+  return {
+    gemini: Boolean(geminiConfig()),
+    openrouter: Boolean(openrouterConfig()),
+    default: clean(process.env.LLM_DEFAULT_PROVIDER).toLowerCase() || (geminiConfig() ? 'gemini' : 'openrouter')
+  };
 }
 
 function titleCase(value) {
